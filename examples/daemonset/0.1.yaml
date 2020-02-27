@@ -1,0 +1,25 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: starboard-ds
+  labels:
+spec:
+  selector:
+    matchLabels:
+      name: starboard-ds 
+  template:
+    metadata:
+      labels:
+        name: starboard-ds 
+    spec:
+      hostNetwork: true
+      containers:
+      - name: starboard-ds
+        image: plndr/starboard:0.1
+        imagePullPolicy: Always
+        securityContext:
+          capabilities:
+            add:
+            - NET_ADMIN
+            - NET_RAW
+            - SYS_ADMIN
