@@ -1,7 +1,0 @@
-FROM alpine
-
-RUN apk add --no-cache iptables
-COPY starboard starboard
-WORKDIR /tmp
-#Run binary
-CMD ["/starboard"]
