@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"flag"
 	"fmt"
 	"os"
@@ -60,7 +59,7 @@ func main() {
 	}
 
 	// TODO - Needs changing to (with cancel)
-	ctx := context.TODO()
+	//ctx := context.TODO()
 
 	// Build a options structure to defined what we're looking for
 	listOptions := metav1.ListOptions{
@@ -70,7 +69,7 @@ func main() {
 	// Use a restartable watcher, as this should help in the event of etcd or timeout issues
 	rw, err := watchtools.NewRetryWatcher("1", &cache.ListWatch{
 		WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
-			return clientset.CoreV1().ConfigMaps("default").Watch(ctx, listOptions)
+			return clientset.CoreV1().ConfigMaps("default").Watch(listOptions)
 		},
 	})
 
