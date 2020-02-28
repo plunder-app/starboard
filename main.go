@@ -25,7 +25,7 @@ import (
 var OutSideCluster bool
 
 //previousCidr - this is used to determine if the existing rule needs deleting
-var previousCidr string
+var currentCidr, previousCidr string
 
 const plndrConfigMap = "plndr-configmap"
 
@@ -87,28 +87,32 @@ func main() {
 	}
 
 	signalChan := make(chan os.Signal, 1)
-	signal.Notify(signalChan, os.Interrupt)
+	signal.Notify(signalChan, os.Interrupt, os.Kill)
 	go func() {
 		for event := range ch {
 
 			// We need to inspect the event and get ResourceVersion out of it
 			switch event.Type {
 			case watch.Added, watch.Modified:
+				// A Modification event has been triggered
 				log.Debugf("ConfigMap [%s] has been Created or modified", plndrConfigMap)
 				cm, ok := event.Object.(*v1.ConfigMap)
 				if !ok {
 					log.Errorf("Unable to parse ConfigMap from watcher")
 					break
 				}
-				cidr := cm.Data["cidr"]
-				log.Infof("Found %s services defined in ConfigMap", cidr)
+				// Retrieve the cidr from the configMap
+				currentCidr = cm.Data["cidr"]
+				log.Infof("Found %s services defined in ConfigMap", currentCidr)
 
-				ruleExists, err := i.Exists("nat", "PREROUTING", "-d", cidr, "-j", "ACCEPT")
+				// Check if it exists
+				ruleExists, err := i.Exists("nat", "PREROUTING", "-d", currentCidr, "-j", "ACCEPT")
 				if err != nil {
 					log.Fatalf("Unable to verify updated cidr configuration: %s", err.Error())
 				}
 
-				if ruleExists == true && previousCidr != "" {
+				// If the rule doesn't exist, and a previous rule does we need to clear the old rule
+				if ruleExists == false && previousCidr != "" {
 					// Check if a previous rule exists, if it does we should remove it
 					previousRuleExists, err := i.Exists("nat", "PREROUTING", "-d", previousCidr, "-j", "ACCEPT")
 					if err != nil {
@@ -122,18 +126,18 @@ func main() {
 							log.Infof("Removed previous rule for cidr [%s]", previousCidr)
 						}
 					}
-
 				}
+
+				// If the rule doesn't exist, we need to add it
 				if !ruleExists {
-					log.Warnf("Not found iptables rule for load-balancer cidr [%s]", cidr)
+					log.Warnf("Not found iptables rule for load-balancer cidr [%s]", currentCidr)
+					err = i.Insert("nat", "PREROUTING", 1, "-d", currentCidr, "-j", "ACCEPT")
+					if err != nil {
+						log.Fatalf("error creating cidr rule: %s", err.Error())
+					}
+					log.Infof("Updated configuration with new cidr [%s]", currentCidr)
+					previousCidr = currentCidr
 				}
-
-				err = i.Insert("nat", "PREROUTING", 1, "-d", cidr, "-j", "ACCEPT")
-				if err != nil {
-					log.Fatalf("error creating cidr rule: %s", err.Error())
-				}
-				log.Infof("Updated configuration with new cidr [%s]", cidr)
-				previousCidr = cidr
 
 			case watch.Deleted:
 				log.Debugf("ConfigMap [%s] has been Deleted", plndrConfigMap)
@@ -173,17 +177,17 @@ func main() {
 	}()
 	<-signalChan
 
-	// Attempt to remove the previous rule
-	previousRuleExists, err := i.Exists("nat", "PREROUTING", "-d", previousCidr, "-j", "ACCEPT")
+	// Attempt to remove the existing rule
+	previousRuleExists, err := i.Exists("nat", "PREROUTING", "-d", currentCidr, "-j", "ACCEPT")
 	if err != nil {
-		log.Warnf("error checking for cidr [%s], safe to ignore (rule may need manually cleaning", previousCidr)
+		log.Warnf("error checking for cidr [%s], safe to ignore (rule may need manually cleaning", currentCidr)
 	} else {
 		if previousRuleExists == true {
-			err = i.Delete("nat", "PREROUTING", "-d", previousCidr, "-j", "ACCEPT")
+			err = i.Delete("nat", "PREROUTING", "-d", currentCidr, "-j", "ACCEPT")
 			if err != nil {
-				log.Fatalf("error removing cidr [%s]: %s", previousCidr, err.Error())
+				log.Fatalf("error removing cidr [%s]: %s", currentCidr, err.Error())
 			}
-			log.Infof("Removed rule for cidr [%s]", previousCidr)
+			log.Infof("Removed rule for cidr [%s]", currentCidr)
 		}
 	}
 
