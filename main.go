@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"syscall"
 
 	iptables "github.com/coreos/go-iptables/iptables"
 	"github.com/davecgh/go-spew/spew"
@@ -87,7 +88,16 @@ func main() {
 	}
 
 	signalChan := make(chan os.Signal, 1)
-	signal.Notify(signalChan, os.Interrupt, os.Kill)
+
+	// Add Notification for Userland interrupt
+	signal.Notify(signalChan, syscall.SIGINT)
+
+	// Add Notification for SIGTERM (sent from Kubernetes)
+	signal.Notify(signalChan, syscall.SIGTERM)
+
+	// Add Notification for SIGKILL (sent from Kubernetes)
+	signal.Notify(signalChan, syscall.SIGKILL)
+
 	go func() {
 		for event := range ch {
 
