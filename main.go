@@ -28,7 +28,7 @@ var OutSideCluster bool
 
 var previousConfig map[string]string
 
-const plndrConfigMap = "plndr-configmap"
+const plndrConfigMap = "plndr"
 
 func main() {
 	flag.CommandLine.BoolVar(&OutSideCluster, "outsideCluster", false, "Use ~/.kube/config to run starboard")
