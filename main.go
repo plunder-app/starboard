@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	iptables "github.com/coreos/go-iptables/iptables"
@@ -25,8 +26,7 @@ import (
 //OutSideCluster - defines the type of connectivity to use
 var OutSideCluster bool
 
-//previousCidr - this is used to determine if the existing rule needs deleting
-var currentCidr, previousCidr string
+var previousConfig map[string]string
 
 const plndrConfigMap = "plndr-configmap"
 
@@ -61,7 +61,7 @@ func main() {
 
 	// TODO - Needs changing to (with cancel)
 	//ctx := context.TODO()
-
+	previousConfig = make(map[string]string)
 	// Build a options structure to defined what we're looking for
 	listOptions := metav1.ListOptions{
 		FieldSelector: fmt.Sprintf("metadata.name=%s", plndrConfigMap),
@@ -70,7 +70,7 @@ func main() {
 	// Use a restartable watcher, as this should help in the event of etcd or timeout issues
 	rw, err := watchtools.NewRetryWatcher("1", &cache.ListWatch{
 		WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
-			return clientset.CoreV1().ConfigMaps("default").Watch(listOptions)
+			return clientset.CoreV1().ConfigMaps("kube-system").Watch(listOptions)
 		},
 	})
 
@@ -111,57 +111,109 @@ func main() {
 					log.Errorf("Unable to parse ConfigMap from watcher")
 					break
 				}
-				// Retrieve the cidr from the configMap
-				currentCidr = cm.Data["cidr"]
-				log.Infof("Found %s services defined in ConfigMap", currentCidr)
 
-				// Check if it exists
-				ruleExists, err := i.Exists("nat", "PREROUTING", "-d", currentCidr, "-j", "ACCEPT")
-				if err != nil {
-					log.Fatalf("Unable to verify updated cidr configuration: %s", err.Error())
+				// Grab all of the configurations we're aware of, we can then compare to the update to find any that have been deleted
+				var previousEntries, currentEntries []string
+				for k := range previousConfig {
+					previousEntries = append(previousEntries, k)
 				}
 
-				// If the rule doesn't exist, and a previous rule does we need to clear the old rule
-				if ruleExists == false && previousCidr != "" {
-					// Check if a previous rule exists, if it does we should remove it
-					previousRuleExists, err := i.Exists("nat", "PREROUTING", "-d", previousCidr, "-j", "ACCEPT")
-					if err != nil {
-						log.Warnf("error checking for previous cidr [%s], safe to ignore", previousCidr)
-					} else {
-						if previousRuleExists == true {
-							err = i.Delete("nat", "PREROUTING", "-d", previousCidr, "-j", "ACCEPT")
+				// Iterate through the cidr configurations
+				for k, v := range cm.Data {
+
+					if strings.HasPrefix(k, "cidr-") {
+						log.Infof("Processing configuration [%s] with cidr [%s]", k, v)
+
+						// Grab all of the entries in the configmap
+						currentEntries = append(currentEntries, k)
+
+						// Check if the rule already exists in the iptables configuration
+						comment := fmt.Sprintf("kube-vip rule for [%s]", k)
+
+						ruleExists, err := i.Exists("nat", "PREROUTING", "-d", v, "-j", "ACCEPT", "-m", "comment", "--comment", comment)
+						if err != nil {
+							log.Fatalf("Unable to verify updated cidr configuration: %s", err.Error())
+						}
+
+						// if the rule doesn't exist,and a previous rule does we need to clear the old rule
+						if ruleExists == false && previousConfig[k] != "" {
+							comment := fmt.Sprintf("kube-vip rule for [%s]", k)
+
+							previousRuleExists, err := i.Exists("nat", "PREROUTING", "-d", previousConfig[k], "-j", "ACCEPT", "-m", "comment", "--comment", comment)
 							if err != nil {
-								log.Fatalf("error removing previous cidr [%s]: %s", previousCidr, err.Error())
+								log.Warnf("error checking for previous cidr [%s], safe to ignore", previousConfig[k], "-m", "comment", "--comment", comment)
+							} else {
+								if previousRuleExists == true {
+									err = i.Delete("nat", "PREROUTING", "-d", previousConfig[k], "-j", "ACCEPT", "-m", "comment", "--comment", comment)
+									if err != nil {
+										log.Fatalf("error removing previous cidr [%s]: %s", previousConfig[k], err.Error())
+									}
+									log.Infof("Removed previous rule for cidr [%s]", previousConfig[k])
+								}
 							}
-							log.Infof("Removed previous rule for cidr [%s]", previousCidr)
+						}
+
+						// If the rule doesn't exist, we need to add it
+						if !ruleExists {
+							log.Warnf("Not found iptables rule for load-balancer cidr [%s]", v)
+							comment := fmt.Sprintf("kube-vip rule for [%s]", k)
+							err = i.Insert("nat", "PREROUTING", 1, "-d", v, "-j", "ACCEPT", "-m", "comment", "--comment", comment)
+							if err != nil {
+								log.Fatalf("error creating cidr rule: %s", err.Error())
+							}
+							log.Infof("Updated configuration with new cidr [%s]", v)
+						}
+						// Store the previous configuration so we can remove if needed
+						previousConfig[k] = v
+					}
+				}
+				// Remove the outliers, this will compare the previous configuration with the new and remove any entries from the iptables rules (if they exist)
+				for x := range previousEntries {
+					var found bool
+					for y := range currentEntries {
+						if previousEntries[x] == currentEntries[y] {
+							found = true
 						}
 					}
-				}
+					// If it's not found in the new rules then it requires removing, as it's been removed from teh configMap
+					if found == false {
+						comment := fmt.Sprintf("kube-vip rule for [%s]", previousEntries[x])
 
-				// If the rule doesn't exist, we need to add it
-				if !ruleExists {
-					log.Warnf("Not found iptables rule for load-balancer cidr [%s]", currentCidr)
-					err = i.Insert("nat", "PREROUTING", 1, "-d", currentCidr, "-j", "ACCEPT")
-					if err != nil {
-						log.Fatalf("error creating cidr rule: %s", err.Error())
+						previousRuleExists, err := i.Exists("nat", "PREROUTING", "-d", previousConfig[previousEntries[x]], "-j", "ACCEPT", "-m", "comment", "--comment", comment)
+						if err != nil {
+							log.Warnf("error checking for previous cidr [%s], safe to ignore", previousConfig[previousEntries[x]], "-m", "comment", "--comment", comment)
+						} else {
+							if previousRuleExists == true {
+								err = i.Delete("nat", "PREROUTING", "-d", previousConfig[previousEntries[x]], "-j", "ACCEPT", "-m", "comment", "--comment", comment)
+								if err != nil {
+									log.Fatalf("error removing previous cidr [%s]: %s", previousConfig[previousEntries[x]], err.Error())
+								}
+								log.Infof("Removed previous rule for cidr [%s]", previousConfig[previousEntries[x]])
+							}
+						}
+						// Remove from the configuration map
+						delete(previousConfig, previousEntries[x])
 					}
-					log.Infof("Updated configuration with new cidr [%s]", currentCidr)
-					previousCidr = currentCidr
 				}
 
 			case watch.Deleted:
 				log.Debugf("ConfigMap [%s] has been Deleted", plndrConfigMap)
-				// Attempt to remove the previous rule
-				previousRuleExists, err := i.Exists("nat", "PREROUTING", "-d", previousCidr, "-j", "ACCEPT")
-				if err != nil {
-					log.Warnf("error checking for cidr [%s], safe to ignore (rule may need manually cleaning", previousCidr)
-				} else {
-					if previousRuleExists == true {
-						err = i.Delete("nat", "PREROUTING", "-d", previousCidr, "-j", "ACCEPT")
-						if err != nil {
-							log.Fatalf("error removing cidr [%s]: %s", previousCidr, err.Error())
+				// Loop through map and tidy
+				for k, v := range previousConfig {
+					// Attempt to remove the existing rule
+					comment := fmt.Sprintf("kube-vip rule for [%s]", k)
+
+					previousRuleExists, err := i.Exists("nat", "PREROUTING", "-d", v, "-j", "ACCEPT", "-m", "comment", "--comment", comment)
+					if err != nil {
+						log.Warnf("error checking for cidr [%s], safe to ignore (rule may need manually cleaning", v)
+					} else {
+						if previousRuleExists == true {
+							err = i.Delete("nat", "PREROUTING", "-d", v, "-j", "ACCEPT", "-m", "comment", "--comment", comment)
+							if err != nil {
+								log.Fatalf("error removing cidr [%s] fo [%s]: %s", v, k, err.Error())
+							}
+							log.Infof("Removed rule for cidr [%s]", k)
 						}
-						log.Infof("Removed rule for cidr [%s]", previousCidr)
 					}
 				}
 			case watch.Bookmark:
@@ -187,17 +239,22 @@ func main() {
 	}()
 	<-signalChan
 
-	// Attempt to remove the existing rule
-	previousRuleExists, err := i.Exists("nat", "PREROUTING", "-d", currentCidr, "-j", "ACCEPT")
-	if err != nil {
-		log.Warnf("error checking for cidr [%s], safe to ignore (rule may need manually cleaning", currentCidr)
-	} else {
-		if previousRuleExists == true {
-			err = i.Delete("nat", "PREROUTING", "-d", currentCidr, "-j", "ACCEPT")
-			if err != nil {
-				log.Fatalf("error removing cidr [%s]: %s", currentCidr, err.Error())
+	// Loop through map and tidy
+	for k, v := range previousConfig {
+		// Attempt to remove the existing rule
+		comment := fmt.Sprintf("kube-vip rule for [%s]", k)
+		log.Debugf("Evaluating rule [%s]")
+		previousRuleExists, err := i.Exists("nat", "PREROUTING", "-d", v, "-j", "ACCEPT", "-m", "comment", "--comment", comment)
+		if err != nil {
+			log.Warnf("error checking for cidr [%s], safe to ignore (rule may need manually cleaning", v)
+		} else {
+			if previousRuleExists == true {
+				err = i.Delete("nat", "PREROUTING", "-d", v, "-j", "ACCEPT", "-m", "comment", "--comment", comment)
+				if err != nil {
+					log.Fatalf("error removing cidr [%s] fo [%s]: %s", v, k, err.Error())
+				}
+				log.Infof("Removed rule for cidr [%s]", k)
 			}
-			log.Infof("Removed rule for cidr [%s]", currentCidr)
 		}
 	}
 
